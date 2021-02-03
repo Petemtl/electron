@@ -8,6 +8,7 @@
 
 #include <utility>
 
+#include "base/barrier_closure.h"
 #include "base/command_line.h"
 #include "base/files/file_path.h"
 #include "base/no_destructor.h"
@@ -28,6 +29,8 @@
 #include "components/proxy_config/proxy_config_pref_names.h"
 #include "content/browser/blob_storage/chrome_blob_storage_context.h"  // nogncheck
 #include "content/public/browser/browser_thread.h"
+#include "content/public/browser/cors_origin_pattern_setter.h"
+#include "content/public/browser/shared_cors_origin_access_list.h"
 #include "content/public/browser/storage_partition.h"
 #include "mojo/public/cpp/bindings/self_owned_receiver.h"
 #include "net/base/escape.h"
@@ -431,9 +434,33 @@ void ElectronBrowserContext::SetCorsOriginAccessListForOrigin(
     std::vector<network::mojom::CorsOriginPatternPtr> allow_patterns,
     std::vector<network::mojom::CorsOriginPatternPtr> block_patterns,
     base::OnceClosure closure) {
-  // TODO(nornagon): actually set the CORS access lists. This is called from
-  // extensions/browser/renderer_startup_helper.cc.
-  base::ThreadTaskRunnerHandle::Get()->PostTask(FROM_HERE, std::move(closure));
+  auto& context_map = ElectronBrowserContext::browser_context_map();
+  auto barrier_closure =
+      BarrierClosure(1 + context_map.size(), std::move(closure));
+
+  for (auto& iter : context_map) {
+    if (iter.second) {
+      auto bc_setter = base::MakeRefCounted<content::CorsOriginPatternSetter>(
+          source_origin,
+          content::CorsOriginPatternSetter::ClonePatterns(allow_patterns),
+          content::CorsOriginPatternSetter::ClonePatterns(block_patterns),
+          barrier_closure);
+      ForEachStoragePartition(
+          std::move(iter.second.get()),
+          base::BindRepeating(&content::CorsOriginPatternSetter::SetLists,
+                              base::RetainedRef(bc_setter.get())));
+    }
+  }
+
+  // Keep the per-profile access list up to date so that we can use this to
+  // restore NetworkContext settings at anytime, e.g. on restarting the
+  // network service.
+  scoped_refptr<content::SharedCorsOriginAccessList>
+      shared_cors_origin_access_list =
+          content::SharedCorsOriginAccessList::Create();
+  shared_cors_origin_access_list->SetForOrigin(
+      source_origin, std::move(allow_patterns), std::move(block_patterns),
+      barrier_closure);
 }
 
 ResolveProxyHelper* ElectronBrowserContext::GetResolveProxyHelper() {
